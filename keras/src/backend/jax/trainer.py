@@ -38,15 +38,15 @@ class JAXTrainer(base_trainer.Trainer):
         self._jax_state_synced = True
 
     def compute_loss_and_updates(
-        self,
-        trainable_variables,
-        non_trainable_variables,
-        metrics_variables,
-        x,
-        y,
-        sample_weight,
-        training=False,
-        optimizer_variables=None,
+            self,
+            trainable_variables,
+            non_trainable_variables,
+            metrics_variables,
+            x,
+            y,
+            sample_weight,
+            training=False,
+            optimizer_variables=None,
     ):
         """This method is stateless and is intended for use with jax.grad."""
         kwargs = {}
@@ -97,13 +97,13 @@ class JAXTrainer(base_trainer.Trainer):
         )
 
     def _update_metrics_variables(
-        self, metrics_variables, unscaled_loss, x, y, y_pred, sample_weight
+            self, metrics_variables, unscaled_loss, x, y, y_pred, sample_weight
     ):
         with backend.StatelessScope(
-            state_mapping=[
-                (ref_v, v)
-                for ref_v, v in zip(self.metrics_variables, metrics_variables)
-            ]
+                state_mapping=[
+                    (ref_v, v)
+                    for ref_v, v in zip(self.metrics_variables, metrics_variables)
+                ]
         ) as scope:
             self._loss_tracker.update_state(
                 unscaled_loss,
@@ -208,51 +208,71 @@ class JAXTrainer(base_trainer.Trainer):
         )
         return outputs, non_trainable_variables
 
-    def _make_function(self, step_function, concatenate_outputs=False):
+    def _make_function(
+            self,
+            step_function,
+            concatenate_outputs=False,
+            donate_argnums=0,
+            out_shardings=None
+    ):
         if self.steps_per_execution > 1:
-            if concatenate_outputs:
+            def fn(state, data):
+                outputs, state = step_function(state, data)
+                return state, outputs
 
-                def concatenate(outputs):
-                    output = outputs[0]
-                    for next_output in outputs[1:]:
-                        output = tree.map_structure(
-                            lambda t1, t2: jax.numpy.concatenate([t1, t2]),
-                            output,
-                            next_output,
-                        )
-                    return output
+            def multistep_function(state, data_stack):
+                data_stack = jax.tree.map(lambda *args: jax.numpy.stack(args, 0), *data_stack)
+                state, outputs = jax.lax.scan(
+                    fn,
+                    init=state,
+                    xs=data_stack
+                )
+                if not concatenate_outputs:
+                    outputs = jax.tree.map(lambda xi: xi[-1], outputs)
+                return outputs, state
 
-                if not self.run_eagerly and self.jit_compile:
-                    concatenate = jit(concatenate)
+            if not self.run_eagerly and self.jit_compile:
+                step_function = jit(
+                    step_function,
+                    donate_argnums=donate_argnums,
+                    out_shardings=out_shardings
+                )
+                multistep_function = jit(
+                    multistep_function,
+                    donate_argnums=donate_argnums,
+                    out_shardings=out_shardings
+                )
 
-                def iterator_step(state, iterator):
-                    data = next(iterator)
-                    outputs, state = step_function(state, data)
-                    outputs = [outputs]
-                    try:
-                        for _ in range(self.steps_per_execution - 1):
-                            data = next(iterator)
-                            _outputs, state = step_function(state, data)
-                            outputs.append(_outputs)
-                    except StopIteration:
-                        pass
-                    outputs = concatenate(outputs)
+            def batch_size(batch):
+                leaves, treedef = jax.tree.flatten(batch)
+                return leaves[0].shape
+
+            def iterator_step(state, iterator):
+                data_stack = []
+                try:
+                    for _ in range(self.steps_per_execution):
+                        data_stack.append(next(iterator))
+                except StopIteration:
+                    pass
+
+                if len(data_stack) == 0:
+                    raise StopIteration
+                elif len(data_stack) == 1:
+                    outputs, state = step_function(state, data_stack[0])
+                elif batch_size(data_stack[0]) != batch_size(data_stack[-1]):
+                    outputs, state = multistep_function(state, data_stack[:-1])
+                    outputs, state = step_function(state, data_stack[-1])
                     return outputs, state
 
-            else:
-
-                def iterator_step(state, iterator):
-                    data = next(iterator)
-                    outputs, state = step_function(state, data)
-                    try:
-                        for _ in range(self.steps_per_execution - 1):
-                            data = next(iterator)
-                            outputs, state = step_function(state, data)
-                    except StopIteration:
-                        pass
-                    return outputs, state
+                return multistep_function(state, data_stack)
 
         else:
+            if not self.run_eagerly and self.jit_compile:
+                step_function = jit(
+                    step_function,
+                    donate_argnums=donate_argnums,
+                    out_shardings=out_shardings
+                )
 
             def iterator_step(state, iterator):
                 return step_function(state, next(iterator))
@@ -262,26 +282,19 @@ class JAXTrainer(base_trainer.Trainer):
     def make_train_function(self, force=False):
         if self.train_function is not None and not force:
             return
-        if not self.run_eagerly and self.jit_compile:
-            out_shardings = None
-            if distribution_lib.distribution() is not None:
-                state_shardings = self._get_state_sharding_spec()
-                out_shardings = (None, state_shardings)
-            if is_nnx_enabled():
-                step_fn = lambda state, data: type(self).train_step(
-                    self, state, data
-                )
-            else:
-                step_fn = self.train_step
-            train_step = jit(
-                step_fn,
-                donate_argnums=0,
-                out_shardings=out_shardings,
+
+        out_shardings = None
+        if distribution_lib.distribution() is not None:
+            state_shardings = self._get_state_sharding_spec()
+            out_shardings = (None, state_shardings)
+        if is_nnx_enabled():
+            step_fn = lambda state, data: type(self).train_step(
+                self, state, data
             )
         else:
-            train_step = self.train_step
+            step_fn = self.train_step
 
-        step_function = self._make_function(train_step)
+        step_function = self._make_function(step_fn, donate_argnums=0, out_shardings=out_shardings)
 
         self.train_function = step_function
 
@@ -309,15 +322,12 @@ class JAXTrainer(base_trainer.Trainer):
                 )
             else:
                 step_fn = self.test_step
-            test_step = jit(
-                step_fn,
-                donate_argnums=0,
-                out_shardings=out_shardings,
-            )
+            test_step = step_fn
         else:
+            out_shardings = None
             test_step = self.test_step
 
-        step_function = self._make_function(test_step)
+        step_function = self._make_function(test_step, donate_argnums=0, out_shardings=out_shardings)
 
         self.test_function = step_function
 
@@ -343,14 +353,11 @@ class JAXTrainer(base_trainer.Trainer):
                     non_trainable_shardings,
                 )
                 out_shardings = (None, state_shardings)
-            predict_step = jit(
-                predict_step,
-                donate_argnums=0,
-                out_shardings=out_shardings,
-            )
+        else:
+            out_shardings = None
 
         _step_function = self._make_function(
-            predict_step, concatenate_outputs=True
+            predict_step, concatenate_outputs=True, donate_argnums=0, out_shardings=out_shardings
         )
 
         def step_function(state, iterator):
@@ -361,23 +368,23 @@ class JAXTrainer(base_trainer.Trainer):
 
     @traceback_utils.filter_traceback
     def fit(
-        self,
-        x=None,
-        y=None,
-        batch_size=None,
-        epochs=1,
-        verbose="auto",
-        callbacks=None,
-        validation_split=0.0,
-        validation_data=None,
-        shuffle=True,
-        class_weight=None,
-        sample_weight=None,
-        initial_epoch=0,
-        steps_per_epoch=None,
-        validation_steps=None,
-        validation_batch_size=None,
-        validation_freq=1,
+            self,
+            x=None,
+            y=None,
+            batch_size=None,
+            epochs=1,
+            verbose="auto",
+            callbacks=None,
+            validation_split=0.0,
+            validation_data=None,
+            shuffle=True,
+            class_weight=None,
+            sample_weight=None,
+            initial_epoch=0,
+            steps_per_epoch=None,
+            validation_steps=None,
+            validation_batch_size=None,
+            validation_freq=1,
     ):
         self._assert_compile_called("fit")
         # Possibly cap epochs for debugging runs.
@@ -496,7 +503,7 @@ class JAXTrainer(base_trainer.Trainer):
 
                 # Run validation.
                 if validation_data is not None and self._should_eval(
-                    epoch, validation_freq
+                        epoch, validation_freq
                 ):
                     # Create JAXEpochIterator for evaluation and cache it.
                     if getattr(self, "_eval_epoch_iterator", None) is None:
@@ -533,8 +540,8 @@ class JAXTrainer(base_trainer.Trainer):
         finally:
             self.jax_state_sync()
             if (
-                isinstance(self.optimizer, optimizers_module.Optimizer)
-                and epochs > 0
+                    isinstance(self.optimizer, optimizers_module.Optimizer)
+                    and epochs > 0
             ):
                 self.optimizer.finalize_variable_values(self.trainable_weights)
 
@@ -549,16 +556,16 @@ class JAXTrainer(base_trainer.Trainer):
 
     @traceback_utils.filter_traceback
     def evaluate(
-        self,
-        x=None,
-        y=None,
-        batch_size=None,
-        verbose="auto",
-        sample_weight=None,
-        steps=None,
-        callbacks=None,
-        return_dict=False,
-        **kwargs,
+            self,
+            x=None,
+            y=None,
+            batch_size=None,
+            verbose="auto",
+            sample_weight=None,
+            steps=None,
+            callbacks=None,
+            return_dict=False,
+            **kwargs,
     ):
         self._assert_compile_called("evaluate")
         # TODO: respect compiled trainable state
@@ -652,7 +659,7 @@ class JAXTrainer(base_trainer.Trainer):
 
     @traceback_utils.filter_traceback
     def predict(
-        self, x, batch_size=None, verbose="auto", steps=None, callbacks=None
+            self, x, batch_size=None, verbose="auto", steps=None, callbacks=None
     ):
         # Create an iterator that yields batches of input data.
         epoch_iterator = JAXEpochIterator(
@@ -748,12 +755,12 @@ class JAXTrainer(base_trainer.Trainer):
         return tree.map_structure_up_to(batch_outputs, np.concatenate, outputs)
 
     def train_on_batch(
-        self,
-        x,
-        y=None,
-        sample_weight=None,
-        class_weight=None,
-        return_dict=False,
+            self,
+            x,
+            y=None,
+            sample_weight=None,
+            class_weight=None,
+            return_dict=False,
     ):
         self._assert_compile_called("train_on_batch")
         if class_weight is not None:
@@ -808,11 +815,11 @@ class JAXTrainer(base_trainer.Trainer):
         return self._flatten_metrics_in_order(logs)
 
     def test_on_batch(
-        self,
-        x,
-        y=None,
-        sample_weight=None,
-        return_dict=False,
+            self,
+            x,
+            y=None,
+            sample_weight=None,
+            return_dict=False,
     ):
         self._assert_compile_called("test_on_batch")
 
@@ -891,7 +898,7 @@ class JAXTrainer(base_trainer.Trainer):
                 ref_v.assign(v)
         if non_trainable_variables:
             for ref_v, v in zip(
-                self.non_trainable_variables, non_trainable_variables
+                    self.non_trainable_variables, non_trainable_variables
             ):
                 ref_v.assign(v)
         if optimizer_variables:
@@ -924,11 +931,11 @@ class JAXTrainer(base_trainer.Trainer):
         )
 
     def _purge_model_variables(
-        self,
-        trainable_variables=False,
-        non_trainable_variables=False,
-        optimizer_variables=False,
-        metrics_variables=False,
+            self,
+            trainable_variables=False,
+            non_trainable_variables=False,
+            optimizer_variables=False,
+            metrics_variables=False,
     ):
         """Remove all the model variable for memory saving.
 
@@ -954,12 +961,12 @@ class JAXTrainer(base_trainer.Trainer):
                 v._value = None
 
     def _get_jax_state(
-        self,
-        trainable_variables=False,
-        non_trainable_variables=False,
-        optimizer_variables=False,
-        metrics_variables=False,
-        purge_model_variables=False,
+            self,
+            trainable_variables=False,
+            non_trainable_variables=False,
+            optimizer_variables=False,
+            metrics_variables=False,
+            purge_model_variables=False,
     ):
         state = []
         if trainable_variables:
