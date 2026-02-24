@@ -220,7 +220,10 @@ class JAXTrainer(base_trainer.Trainer):
                 outputs, state = step_function(state, data)
                 return state, outputs
 
+            # stack_and_scan
             def multistep_function(state, data_stack):
+                if len(data_stack) == 1:
+                    return step_function(state, data_stack[0])
                 data_stack = jax.tree.map(lambda *args: jax.numpy.stack(args, 0), *data_stack)
                 state, outputs = jax.lax.scan(
                     fn,
@@ -232,7 +235,7 @@ class JAXTrainer(base_trainer.Trainer):
                 return outputs, state
 
             if not self.run_eagerly and self.jit_compile:
-                step_function = jit(
+                step_function_ = jit(
                     step_function,
                     donate_argnums=donate_argnums,
                     out_shardings=out_shardings
@@ -243,9 +246,12 @@ class JAXTrainer(base_trainer.Trainer):
                     out_shardings=out_shardings
                 )
 
-            def batch_size(batch):
-                leaves, treedef = jax.tree.flatten(batch)
-                return leaves[0].shape
+            def same_batch_size(data_stack):
+                b0 = data_stack[0]
+                b1 = data_stack[-1]
+                leaves0 = jax.tree.leaves(b0)
+                leaves1 = jax.tree.leaves(b1)
+                return leaves0[0].shape[0] == leaves1[0].shape[0]
 
             def iterator_step(state, iterator):
                 data_stack = []
@@ -257,11 +263,10 @@ class JAXTrainer(base_trainer.Trainer):
 
                 if len(data_stack) == 0:
                     raise StopIteration
-                elif len(data_stack) == 1:
-                    outputs, state = step_function(state, data_stack[0])
-                elif batch_size(data_stack[0]) != batch_size(data_stack[-1]):
+                elif not same_batch_size(data_stack):
                     outputs, state = multistep_function(state, data_stack[:-1])
-                    outputs, state = step_function(state, data_stack[-1])
+                    outputs, state = step_function_(state, data_stack[-1])
+                    # TODO : concatenate_outputs
                     return outputs, state
 
                 return multistep_function(state, data_stack)
@@ -1006,6 +1011,10 @@ def _distribute_data(data, layouts=None):
 
 
 class JAXEpochIterator(EpochIterator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n = self.steps_per_execution + 1
+
     def __next__(self):
         return next(self._epoch_iterator)
 
@@ -1053,7 +1062,7 @@ class JAXEpochIterator(EpochIterator):
             for data in itertools.islice(numpy_iterator, n):
                 queue.append(_distribute_data(data))
 
-        enqueue(n=2)  # TODO: should we make `n` configurable?
+        enqueue(n=self.n)
         while queue:
             yield queue.popleft()
             enqueue(1)
