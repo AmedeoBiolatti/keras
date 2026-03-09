@@ -215,27 +215,64 @@ class JAXTrainer(base_trainer.Trainer):
             donate_argnums=0,
             out_shardings=None
     ):
+        def _leading_dim(batch):
+            leaves = jax.tree.leaves(batch)
+            if not leaves:
+                raise ValueError("Batch pytree has no leaves.")
+            return leaves[0].shape[0]
+
+        def _concat_outputs(first, second):
+            return tree.map_structure(
+                lambda x, y: jax.numpy.concatenate((x, y), axis=0),
+                first,
+                second,
+            )
+
+        def _flatten_scan_outputs(outputs):
+            return tree.map_structure(
+                lambda x: x.reshape((-1,) + x.shape[2:]), outputs
+            )
+
+        step_function_raw = step_function
+
         if self.steps_per_execution > 1:
-            def fn(state, data):
-                outputs, state = step_function(state, data)
+            def scan_body_with_outputs(state, data):
+                outputs, state = step_function_raw(state, data)
                 return state, outputs
 
+            def scan_body_no_outputs(state, data):
+                _outputs, state = step_function_raw(state, data)
+                return state, None
+
             # stack_and_scan
-            def multistep_function(state, data_stack):
-                if len(data_stack) == 1:
-                    return step_function(state, data_stack[0])
-                data_stack = jax.tree.map(lambda *args: jax.numpy.stack(args, 0), *data_stack)
-                state, outputs = jax.lax.scan(
-                    fn,
-                    init=state,
-                    xs=data_stack
-                )
-                if not concatenate_outputs:
-                    outputs = jax.tree.map(lambda xi: xi[-1], outputs)
-                return outputs, state
+            def multistep_function(state, stacked_data):
+                if concatenate_outputs:
+                    state, outputs = jax.lax.scan(
+                        scan_body_with_outputs,
+                        init=state,
+                        xs=stacked_data
+                    )
+                    return _flatten_scan_outputs(outputs), state
+                else:
+                    n = _leading_dim(stacked_data)
+                    if n == 1:
+                        last = jax.tree.map(lambda xi: xi[-1], stacked_data)
+                        state, outputs = scan_body_with_outputs(state, last)
+                        return outputs, state
+
+                    prefix = jax.tree.map(lambda xi: xi[:-1], stacked_data)
+                    last = jax.tree.map(lambda xi: xi[-1], stacked_data)
+
+                    state, _ = jax.lax.scan(
+                        lambda s, d: (scan_body_no_outputs(s, d)[0], None),
+                        init=state,
+                        xs=prefix,
+                    )
+                    state, outputs = scan_body_with_outputs(state, last)
+                    return outputs, state
 
             if not self.run_eagerly and self.jit_compile:
-                step_function_ = jit(
+                step_function = jit(
                     step_function,
                     donate_argnums=donate_argnums,
                     out_shardings=out_shardings
@@ -246,30 +283,47 @@ class JAXTrainer(base_trainer.Trainer):
                     out_shardings=out_shardings
                 )
 
-            def same_batch_size(data_stack):
-                b0 = data_stack[0]
-                b1 = data_stack[-1]
-                leaves0 = jax.tree.leaves(b0)
-                leaves1 = jax.tree.leaves(b1)
-                return leaves0[0].shape[0] == leaves1[0].shape[0]
-
             def iterator_step(state, iterator):
-                data_stack = []
-                try:
-                    for _ in range(self.steps_per_execution):
-                        data_stack.append(next(iterator))
-                except StopIteration:
-                    pass
+                # Stacked epoch iterator path used in fit().
+                if (
+                        isinstance(iterator, (tuple, list))
+                        and len(iterator) == 2
+                ):
+                    stacked_batches, remainder_batch = iterator
 
-                if len(data_stack) == 0:
-                    raise StopIteration
-                elif not same_batch_size(data_stack):
-                    outputs, state = multistep_function(state, data_stack[:-1])
-                    outputs, state = step_function_(state, data_stack[-1])
-                    # TODO : concatenate_outputs
+                    outputs = None
+                    if stacked_batches is not None:
+                        outputs, state = multistep_function(
+                            state, stacked_batches
+                        )
+                    if remainder_batch is not None:
+                        remainder_outputs, state = step_function(
+                            state, remainder_batch
+                        )
+                        if concatenate_outputs and outputs is not None:
+                            outputs = _concat_outputs(
+                                outputs, remainder_outputs
+                            )
+                        else:
+                            outputs = remainder_outputs
+
                     return outputs, state
 
-                return multistep_function(state, data_stack)
+                # Standard iterator path used in evaluate/predict/*_on_batch.
+                has_step = False
+                outputs = None
+                for _, data in zip(range(self.steps_per_execution), iterator):
+                    has_step = True
+                    step_outputs, state = step_function(state, data)
+                    if not concatenate_outputs:
+                        outputs = step_outputs
+                    elif outputs is None:
+                        outputs = step_outputs
+                    else:
+                        outputs = _concat_outputs(outputs, step_outputs)
+                if not has_step:
+                    raise StopIteration
+                return outputs, state
 
         else:
             if not self.run_eagerly and self.jit_compile:
@@ -300,7 +354,6 @@ class JAXTrainer(base_trainer.Trainer):
             step_fn = self.train_step
 
         step_function = self._make_function(step_fn, donate_argnums=0, out_shardings=out_shardings)
-
         self.train_function = step_function
 
     def make_test_function(self, force=False):
@@ -416,8 +469,10 @@ class JAXTrainer(base_trainer.Trainer):
                 val_sample_weight,
             ) = data_adapter_utils.unpack_x_y_sample_weight(validation_data)
 
+        stacked = (self.steps_per_execution > 1)
         # Create an iterator that yields batches for one epoch.
-        epoch_iterator = JAXEpochIterator(
+        epoch_iterator_cls = JAXEpochStackedIterator if stacked else JAXEpochIterator
+        epoch_iterator = epoch_iterator_cls(
             x=x,
             y=y,
             sample_weight=sample_weight,
@@ -428,7 +483,7 @@ class JAXTrainer(base_trainer.Trainer):
             steps_per_execution=self.steps_per_execution,
         )
 
-        self._symbolic_build(iterator=epoch_iterator)
+        self._symbolic_build(data_batch=epoch_iterator.get_batch())
         epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
@@ -593,7 +648,7 @@ class JAXTrainer(base_trainer.Trainer):
                 steps_per_execution=self.steps_per_execution,
             )
 
-        self._symbolic_build(iterator=epoch_iterator)
+        self._symbolic_build(data_batch=epoch_iterator.get_batch())
         epoch_iterator.reset()
 
         # Container that configures and calls callbacks.
@@ -677,18 +732,14 @@ class JAXTrainer(base_trainer.Trainer):
 
         if not all(layer.built for layer in self._flatten_layers()):
             # Build the model on one batch of data.
-            for _, _, iterator in epoch_iterator:
-                # Build model
-                x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(
-                    next(iterator)
-                )
-                if is_nnx_enabled():
+            x, _, _ = data_adapter_utils.unpack_x_y_sample_weight(
+                epoch_iterator.get_batch()
+            )
+            if is_nnx_enabled():
+                self(x)
+            else:
+                with backend.StatelessScope():
                     self(x)
-                else:
-                    with backend.StatelessScope():
-                        self(x)
-                break
-            epoch_iterator.reset()
         # Container that configures and calls callbacks.
         if not isinstance(callbacks, callbacks_module.CallbackList):
             callbacks = callbacks_module.CallbackList(
@@ -1018,6 +1069,9 @@ class JAXEpochIterator(EpochIterator):
     def __next__(self):
         return next(self._epoch_iterator)
 
+    def get_batch(self):
+        return next(iter(self._get_iterator()))
+
     def _get_iterator(self):
         distribution = distribution_lib.distribution()
         if distribution is not None:
@@ -1066,3 +1120,128 @@ class JAXEpochIterator(EpochIterator):
         while queue:
             yield queue.popleft()
             enqueue(1)
+
+
+class JAXEpochStackedIterator(JAXEpochIterator):
+    """JAX epoch iterator that groups and stacks batches for steps_per_execution.
+
+    Each iteration returns:
+        (begin_step, end_step, (stacked_batch, remainder_batch))
+
+    where:
+      - stacked_batch is a pytree stacked on axis 0 with shape [k, batch, ...]
+        for 1 <= k <= steps_per_execution, or None if no full batch was collected.
+      - remainder_batch is the final partial batch if encountered, else None.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._configured_batch_size = kwargs.get("batch_size", None)
+        self.batch_size = self._configured_batch_size
+        super().__init__(*args, **kwargs)
+        self.n = self.steps_per_execution + 1
+        self._group_prefetch_n = 2
+        self._group_queue = collections.deque()
+
+    def reset(self):
+        self.batch_size = self._configured_batch_size
+        self._group_queue = collections.deque()
+        super().reset()
+
+    def get_batch(self):
+        return next(iter(self._get_iterator()))
+
+    def __next__(self):
+        if not self._group_queue:
+            self._enqueue_groups(self._group_prefetch_n)
+        if not self._group_queue:
+            raise StopIteration
+
+        item = self._group_queue.popleft()
+        self._enqueue_groups(1)
+        return item
+
+    def _enqueue_groups(self, n):
+        for _ in range(n):
+            try:
+                begin_step, end_step, iterator = next(self._epoch_iterator)
+            except StopIteration:
+                return
+
+            target_steps = end_step - begin_step + 1
+            iterator = itertools.islice(iterator, target_steps)
+            grouped_iterator = self._group_batches(
+                iterator, stack_fn=jax.numpy.stack
+            )
+            try:
+                stacked_batch, remainder_batch = next(grouped_iterator)
+            except StopIteration:
+                continue
+
+            actual_steps = self._count_steps(stacked_batch, remainder_batch)
+            if actual_steps == 0:
+                continue
+
+            end_step = begin_step + actual_steps - 1
+            self._group_queue.append(
+                (begin_step, end_step, (stacked_batch, remainder_batch))
+            )
+
+    def _count_steps(self, stacked_batch, remainder_batch):
+        n = 0
+        if stacked_batch is not None:
+            n += self._leading_dim(stacked_batch)
+        if remainder_batch is not None:
+            n += 1
+        return n
+
+    def _leading_dim(self, batch):
+        leaves = tree.flatten(batch)
+        if not leaves:
+            raise ValueError("Batch pytree has no leaves.")
+        return leaves[0].shape[0]
+
+    def _stack_batches(self, batches, stack_fn):
+        return tree.map_structure(lambda *xs: stack_fn(xs, axis=0), *batches)
+
+    def _group_batches(self, iterator, stack_fn):
+        """Turn an iterator of single batches into grouped stacked batches.
+
+        Yields:
+            (stacked_batch, remainder_batch)
+        """
+        iterator = iter(iterator)
+
+        while True:
+            full_batches = []
+            remainder_batch = None
+
+            for _ in range(self.steps_per_execution):
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    break
+
+                batch_dim = self._leading_dim(batch)
+
+                # Infer full batch size from first observed batch if needed.
+                if self.batch_size is None:
+                    self.batch_size = batch_dim
+
+                # If this is a partial batch, keep it separate and stop grouping.
+                if batch_dim < self.batch_size:
+                    remainder_batch = batch
+                    break
+
+                full_batches.append(batch)
+
+            if not full_batches and remainder_batch is None:
+                return
+
+            stacked_batch = None
+            if full_batches:
+                stacked_batch = self._stack_batches(full_batches, stack_fn)
+
+            yield stacked_batch, remainder_batch
+
+    def _get_iterator(self):
+        return super()._get_iterator()
