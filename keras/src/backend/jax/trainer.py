@@ -302,9 +302,12 @@ class JAXTrainer(base_trainer.Trainer):
 
                     outputs = None
                     if stacked_batches is not None:
-                        outputs, state = multistep_function(
-                            state, stacked_batches
-                        )
+                        with jax.profiler.TraceAnnotation(
+                            "stacked.iterator_step.multistep_function"
+                        ):
+                            outputs, state = multistep_function(
+                                state, stacked_batches
+                            )
                     if remainder_batch is not None:
                         # In SPE>1 mode, a smaller remainder batch at epoch end
                         # often triggers a one-time JIT compile for step_function.
@@ -331,9 +334,12 @@ class JAXTrainer(base_trainer.Trainer):
                                     "one-time JIT compile near epoch end."
                                 )
                                 remainder_warning_emitted = True
-                        remainder_outputs, state = step_function(
-                            state, remainder_batch
-                        )
+                        with jax.profiler.TraceAnnotation(
+                            "stacked.iterator_step.remainder_step_function"
+                        ):
+                            remainder_outputs, state = step_function(
+                                state, remainder_batch
+                            )
                         if concatenate_outputs and outputs is not None:
                             outputs = _concat_outputs(
                                 outputs, remainder_outputs
@@ -505,7 +511,7 @@ class JAXTrainer(base_trainer.Trainer):
 
         stacked = (self.steps_per_execution > 1)
         # Create an iterator that yields batches for one epoch.
-        epoch_iterator_cls = JAXEpochStackedIterator if stacked else JAXEpochIterator
+        epoch_iterator_cls = JAXEpochStackedIteratorV2 if stacked else JAXEpochIterator
         epoch_iterator = epoch_iterator_cls(
             x=x,
             y=y,
@@ -547,7 +553,10 @@ class JAXTrainer(base_trainer.Trainer):
                 with epoch_iterator.catch_stop_iteration():
                     for begin_step, end_step, iterator in epoch_iterator:
                         # Callbacks
-                        callbacks.on_train_batch_begin(begin_step)
+                        with jax.profiler.TraceAnnotation(
+                            "fit.on_train_batch_begin"
+                        ):
+                            callbacks.on_train_batch_begin(begin_step)
 
                         # Train step
                         if self._jax_state_synced:
@@ -561,7 +570,10 @@ class JAXTrainer(base_trainer.Trainer):
                             )
                             self._jax_state_synced = False
 
-                        logs, state = self.train_function(state, iterator)
+                        with jax.profiler.TraceAnnotation(
+                            "fit.train_function_call"
+                        ):
+                            logs, state = self.train_function(state, iterator)
                         (
                             trainable_variables,
                             non_trainable_variables,
@@ -578,7 +590,10 @@ class JAXTrainer(base_trainer.Trainer):
                             "metrics_variables": metrics_variables,
                         }
                         # Dispatch callbacks. This takes care of async dispatch.
-                        callbacks.on_train_batch_end(end_step, logs)
+                        with jax.profiler.TraceAnnotation(
+                            "fit.on_train_batch_end"
+                        ):
+                            callbacks.on_train_batch_end(end_step, logs)
 
                         if self.stop_training:
                             # Stop training if a callback has set
@@ -1249,6 +1264,15 @@ class JAXEpochStackedIterator(JAXEpochIterator):
                 continue
         return False
 
+    def _wait_for_queue_slot(self):
+        import time
+
+        while not self._producer_stop_event.is_set():
+            if not self._prefetch_queue.full():
+                return True
+            time.sleep(0.001)
+        return False
+
     def _producer_loop(self):
         try:
             while not self._producer_stop_event.is_set():
@@ -1265,6 +1289,11 @@ class JAXEpochStackedIterator(JAXEpochIterator):
                 actual_steps = self._count_steps(stacked_host, remainder_host)
                 if actual_steps == 0:
                     continue
+
+                # Avoid staging another on-device group when the queue is full.
+                # This reduces allocator pressure (memfree/memcpy sync points).
+                if not self._wait_for_queue_slot():
+                    return
 
                 stacked_batch = self._distribute_tree(stacked_host)
                 remainder_batch = self._distribute_tree(remainder_host)
@@ -1287,6 +1316,9 @@ class JAXEpochStackedIterator(JAXEpochIterator):
             self._producer_stop_event.set()
         if self._producer_thread is not None:
             self._producer_thread.join(timeout=1.0)
+            # Avoid clearing shared state while producer thread may still run.
+            if self._producer_thread.is_alive():
+                return
         self._clear_producer_state()
 
     def _clear_producer_state(self):
@@ -1295,7 +1327,11 @@ class JAXEpochStackedIterator(JAXEpochIterator):
         self._producer_stop_event = None
 
     def __del__(self):
-        self._stop_producer()
+        try:
+            self._stop_producer()
+        except Exception:
+            # Best-effort cleanup during object finalization.
+            pass
 
     def _collect_group(self, iterator, target_steps):
         full_batches = []
@@ -1389,3 +1425,406 @@ class JAXEpochStackedIterator(JAXEpochIterator):
             self._layout_cache[signature] = layouts
 
         return _distribute_data(batch, layouts)
+
+
+class JAXEpochStackedIteratorV2(JAXEpochStackedIterator):
+    """Stacked iterator variant with host+device two-stage prefetch.
+
+    Stage 1 (background thread): collect and stack groups on host.
+    Stage 2 (main thread): move stacked groups to device into a tiny queue.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._host_prefetch_n = 4
+        self._device_prefetch_n = self._group_prefetch_n
+        self._stack_slot_pool = {}
+        self._host_queue = None
+        self._device_queue = None
+        self._host_end = object()
+        self._device_end = object()
+        self._host_producer_thread = None
+        self._host_producer_stop_event = None
+        self._host_producer_error = None
+        self._device_producer_thread = None
+        self._device_producer_stop_event = None
+        self._device_producer_error = None
+        self._host_ended = False
+        self._device_ended = False
+        self._prewarm_done = False
+
+    def reset(self):
+        self._stop_device_producer()
+        self._stop_host_producer()
+        self._clear_v2_state()
+        self._stack_slot_pool = {}
+        super().reset()
+
+    def __next__(self):
+        self._maybe_start_producers()
+        self._prewarm_queues()
+        return self._get_device_item()
+
+    def _maybe_start_producers(self):
+        self._maybe_start_host_producer()
+        self._maybe_start_device_producer()
+
+    def _maybe_start_host_producer(self):
+        if (
+                self._host_producer_thread is not None
+                and self._host_producer_thread.is_alive()
+        ):
+            return
+        if self._host_producer_thread is not None:
+            return
+
+        import queue
+        import threading
+
+        self._host_ended = False
+        self._host_producer_error = None
+        self._host_producer_stop_event = threading.Event()
+        self._host_queue = queue.Queue(maxsize=self._host_prefetch_n)
+        self._host_producer_thread = threading.Thread(
+            target=self._host_producer_loop,
+            name="jax_epoch_stacked_v2_host_prefetch",
+            daemon=True,
+        )
+        self._host_producer_thread.start()
+
+    def _maybe_start_device_producer(self):
+        if (
+                self._device_producer_thread is not None
+                and self._device_producer_thread.is_alive()
+        ):
+            return
+        if self._device_producer_thread is not None:
+            return
+
+        import queue
+        import threading
+
+        self._device_ended = False
+        self._device_producer_error = None
+        self._device_producer_stop_event = threading.Event()
+        self._device_queue = queue.Queue(maxsize=self._device_prefetch_n)
+        self._device_producer_thread = threading.Thread(
+            target=self._device_producer_loop,
+            name="jax_epoch_stacked_v2_device_prefetch",
+            daemon=True,
+        )
+        self._device_producer_thread.start()
+
+    def _put_host_item(self, item):
+        import queue
+
+        with jax.profiler.TraceAnnotation("stacked_v2.host_queue_put"):
+            while not self._host_producer_stop_event.is_set():
+                try:
+                    self._host_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+        return False
+
+    def _host_producer_loop(self):
+        try:
+            while not self._host_producer_stop_event.is_set():
+                with jax.profiler.TraceAnnotation(
+                    "stacked_v2.host_next_epoch_item"
+                ):
+                    try:
+                        begin_step, end_step, iterator = next(self._epoch_iterator)
+                    except StopIteration:
+                        break
+
+                target_steps = end_step - begin_step + 1
+                with jax.profiler.TraceAnnotation(
+                    "stacked_v2.host_collect_group"
+                ):
+                    stacked_host, remainder_host, slot_handle = (
+                        self._collect_group_v2(
+                        iterator, target_steps
+                        )
+                    )
+
+                actual_steps = self._count_steps(stacked_host, remainder_host)
+                if actual_steps == 0:
+                    continue
+
+                actual_end_step = begin_step + actual_steps - 1
+                item = (
+                    begin_step,
+                    actual_end_step,
+                    (stacked_host, remainder_host, slot_handle),
+                )
+                if not self._put_host_item(item):
+                    return
+        except Exception as e:
+            self._host_producer_error = e
+        finally:
+            self._put_host_item(self._host_end)
+
+    def _get_host_item(self):
+        import queue
+
+        with jax.profiler.TraceAnnotation("stacked_v2.host_queue_get"):
+            while True:
+                if self._device_producer_stop_event.is_set():
+                    return None
+                try:
+                    return self._host_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+    def _put_device_item(self, item):
+        import queue
+
+        with jax.profiler.TraceAnnotation("stacked_v2.device_queue_put"):
+            while not self._device_producer_stop_event.is_set():
+                try:
+                    self._device_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+        return False
+
+    def _device_producer_loop(self):
+        try:
+            while not self._device_producer_stop_event.is_set():
+                item = self._get_host_item()
+                if item is None:
+                    return
+                if item is self._host_end:
+                    self._host_ended = True
+                    if self._host_producer_error is not None:
+                        raise self._host_producer_error
+                    break
+
+                begin_step, end_step, (stacked_host, remainder_host, slot_handle) = (
+                    item
+                )
+                with jax.profiler.TraceAnnotation("stacked_v2.device_put_pair"):
+                    try:
+                        stacked_batch, remainder_batch = self._distribute_tree(
+                            (stacked_host, remainder_host)
+                        )
+                    finally:
+                        self._release_stack_slot(slot_handle)
+
+                if not self._put_device_item(
+                    (begin_step, end_step, (stacked_batch, remainder_batch))
+                ):
+                    return
+        except Exception as e:
+            self._device_producer_error = e
+        finally:
+            self._put_device_item(self._device_end)
+
+    def _prewarm_queues(self):
+        if self._prewarm_done:
+            return
+        import time
+
+        # Fill device queue once at startup to avoid first-step bubbles.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if self._device_ended:
+                break
+            if self._device_queue.qsize() >= self._device_prefetch_n:
+                break
+            if self._device_queue.qsize() > 0 and self._host_queue.empty():
+                break
+            time.sleep(0.001)
+        self._prewarm_done = True
+
+    def _get_device_item(self):
+        import queue
+
+        with jax.profiler.TraceAnnotation("stacked_v2.device_queue_get"):
+            while True:
+                if self._device_producer_stop_event.is_set():
+                    raise StopIteration
+                try:
+                    item = self._device_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if (
+                            self._device_producer_thread is not None
+                            and not self._device_producer_thread.is_alive()
+                    ):
+                        self._device_ended = True
+                        self._stop_device_producer()
+                        self._stop_host_producer()
+                        self._clear_v2_state()
+                        if self._device_producer_error is not None:
+                            raise self._device_producer_error
+                        raise StopIteration
+                    continue
+                if item is self._device_end:
+                    self._device_ended = True
+                    self._stop_device_producer()
+                    self._stop_host_producer()
+                    self._clear_v2_state()
+                    if self._device_producer_error is not None:
+                        raise self._device_producer_error
+                    raise StopIteration
+                return item
+
+    def _stop_host_producer(self):
+        if self._host_producer_stop_event is not None:
+            self._host_producer_stop_event.set()
+        if self._host_producer_thread is not None:
+            self._host_producer_thread.join(timeout=1.0)
+            if self._host_producer_thread.is_alive():
+                return
+        self._host_producer_thread = None
+        self._host_producer_stop_event = None
+
+    def _stop_device_producer(self):
+        if self._device_producer_stop_event is not None:
+            self._device_producer_stop_event.set()
+        if self._device_producer_thread is not None:
+            self._device_producer_thread.join(timeout=1.0)
+            if self._device_producer_thread.is_alive():
+                return
+        self._device_producer_thread = None
+        self._device_producer_stop_event = None
+
+    def _clear_v2_state(self):
+        self._host_queue = None
+        self._device_queue = None
+        self._host_ended = False
+        self._device_ended = False
+        self._host_producer_error = None
+        self._device_producer_error = None
+        self._host_producer_thread = None
+        self._host_producer_stop_event = None
+        self._device_producer_thread = None
+        self._device_producer_stop_event = None
+        self._prewarm_done = False
+
+    def __del__(self):
+        try:
+            self._stop_device_producer()
+            self._stop_host_producer()
+        except Exception:
+            pass
+
+    def _collect_group_v2(self, iterator, target_steps):
+        import queue
+
+        full_count = 0
+        remainder_batch = None
+        full_batches = []
+        stacked_slot = None
+        slot_handle = None
+        slot_spec = None
+        slot_buffers = None
+
+        for _ in range(target_steps):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+
+            batch_dim = self._leading_dim(batch)
+            if self.batch_size is None:
+                self.batch_size = batch_dim
+            if batch_dim < self.batch_size:
+                remainder_batch = batch
+                break
+
+            if slot_spec is None:
+                slot_spec = self._get_or_create_stack_slot_spec(batch)
+                if slot_spec is not None:
+                    while not self._host_producer_stop_event.is_set():
+                        try:
+                            slot_index = slot_spec["free_slots"].get(timeout=0.1)
+                            break
+                        except queue.Empty:
+                            continue
+                    else:
+                        break
+                    slot_handle = (slot_spec["signature"], slot_index)
+                    slot_buffers = slot_spec["buffers"][slot_index]
+                    stacked_slot = [None] * slot_spec["num_flat_leaves"]
+
+            if slot_spec is None:
+                full_batches.append(batch)
+                full_count += 1
+                continue
+
+            flat_batch = tree.flatten(batch)
+            for i, leaf_index in enumerate(slot_spec["leaf_indices"]):
+                np.copyto(slot_buffers[i][full_count], flat_batch[leaf_index])
+            full_count += 1
+
+        stacked_batch = None
+        if full_count > 0:
+            if slot_spec is None:
+                stacked_batch = self._stack_batches(full_batches)
+            else:
+                for i, leaf_index in enumerate(slot_spec["leaf_indices"]):
+                    stacked_slot[leaf_index] = slot_buffers[i][:full_count]
+                stacked_batch = tree.pack_sequence_as(
+                    slot_spec["template"], stacked_slot
+                )
+
+        if full_count == 0 and slot_handle is not None:
+            self._release_stack_slot(slot_handle)
+            slot_handle = None
+
+        return stacked_batch, remainder_batch, slot_handle
+
+    def _get_or_create_stack_slot_spec(self, batch):
+        import queue
+
+        leaves = tree.flatten(batch)
+        if any(isinstance(leaf, jax.Array) for leaf in leaves if leaf is not None):
+            return None
+
+        signature = self._shape_signature(batch)
+        spec = self._stack_slot_pool.get(signature, None)
+        if spec is not None:
+            return spec
+
+        leaf_indices = [
+            i for i, leaf in enumerate(leaves) if leaf is not None
+        ]
+        slot_count = max(self._host_prefetch_n + 1, 2)
+        buffers = []
+        for _ in range(slot_count):
+            slot = []
+            for idx in leaf_indices:
+                leaf = leaves[idx]
+                slot.append(
+                    np.empty(
+                        (self.steps_per_execution,) + leaf.shape,
+                        dtype=leaf.dtype,
+                    )
+                )
+            buffers.append(slot)
+
+        free_slots = queue.Queue(maxsize=slot_count)
+        for i in range(slot_count):
+            free_slots.put(i)
+
+        spec = {
+            "signature": signature,
+            "template": batch,
+            "num_flat_leaves": len(leaves),
+            "leaf_indices": leaf_indices,
+            "buffers": buffers,
+            "free_slots": free_slots,
+        }
+        self._stack_slot_pool[signature] = spec
+        return spec
+
+    def _release_stack_slot(self, slot_handle):
+        if slot_handle is None:
+            return
+        signature, slot_index = slot_handle
+        spec = self._stack_slot_pool.get(signature, None)
+        if spec is None:
+            return
+        spec["free_slots"].put(slot_index)
