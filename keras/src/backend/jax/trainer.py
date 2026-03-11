@@ -1211,13 +1211,20 @@ class JAXEpochStackedIterator(JAXEpochIterator):
         item = self._prefetch_queue.get()
         if item is self._queue_end:
             if self._producer_error is not None:
+                self._clear_producer_state()
                 raise self._producer_error
+            self._clear_producer_state()
             raise StopIteration
         return item
 
     def _maybe_start_producer(self):
-        if self._producer_thread is not None:
+        if (
+                self._producer_thread is not None
+                and self._producer_thread.is_alive()
+        ):
             return
+        if self._producer_thread is not None and not self._producer_thread.is_alive():
+            self._clear_producer_state()
 
         import queue
         import threading
@@ -1280,6 +1287,12 @@ class JAXEpochStackedIterator(JAXEpochIterator):
             self._producer_stop_event.set()
         if self._producer_thread is not None:
             self._producer_thread.join(timeout=1.0)
+        self._clear_producer_state()
+
+    def _clear_producer_state(self):
+        self._prefetch_queue = None
+        self._producer_thread = None
+        self._producer_stop_event = None
 
     def __del__(self):
         self._stop_producer()
