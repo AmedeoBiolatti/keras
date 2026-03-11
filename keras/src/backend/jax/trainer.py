@@ -234,6 +234,7 @@ class JAXTrainer(base_trainer.Trainer):
             )
 
         step_function_raw = step_function
+        remainder_warning_emitted = False
 
         if self.steps_per_execution > 1:
             def scan_body_with_outputs(state, data):
@@ -291,6 +292,7 @@ class JAXTrainer(base_trainer.Trainer):
                 )
 
             def iterator_step(state, iterator):
+                nonlocal remainder_warning_emitted
                 # Stacked epoch iterator path used in fit().
                 if (
                         isinstance(iterator, (tuple, list))
@@ -304,6 +306,31 @@ class JAXTrainer(base_trainer.Trainer):
                             state, stacked_batches
                         )
                     if remainder_batch is not None:
+                        # In SPE>1 mode, a smaller remainder batch at epoch end
+                        # often triggers a one-time JIT compile for step_function.
+                        if (
+                                not remainder_warning_emitted
+                                and stacked_batches is not None
+                        ):
+                            leaves = jax.tree.leaves(stacked_batches)
+                            full_batch_dim = (
+                                leaves[0].shape[1]
+                                if leaves and leaves[0].ndim >= 2
+                                else None
+                            )
+                            remainder_dim = _leading_dim(remainder_batch)
+                            if (
+                                    full_batch_dim is not None
+                                    and remainder_dim != full_batch_dim
+                            ):
+                                warnings.warn(
+                                    "JAX fit(): remainder batch size "
+                                    f"{remainder_dim} differs from full batch "
+                                    f"size {full_batch_dim} with "
+                                    "steps_per_execution>1. This can trigger a "
+                                    "one-time JIT compile near epoch end."
+                                )
+                                remainder_warning_emitted = True
                         remainder_outputs, state = step_function(
                             state, remainder_batch
                         )
@@ -1152,13 +1179,21 @@ class JAXEpochStackedIterator(JAXEpochIterator):
         self.batch_size = self._configured_batch_size
         super().__init__(*args, **kwargs)
         self._group_prefetch_n = 2
-        self._group_queue = collections.deque()
         self._layout_cache = {}
+        self._queue_end = object()
+        self._prefetch_queue = None
+        self._producer_thread = None
+        self._producer_stop_event = None
+        self._producer_error = None
 
     def reset(self):
+        self._stop_producer()
         self.batch_size = self._configured_batch_size
-        self._group_queue = collections.deque()
         self._layout_cache = {}
+        self._prefetch_queue = None
+        self._producer_thread = None
+        self._producer_stop_event = None
+        self._producer_error = None
         super().reset()
 
     def get_batch(self):
@@ -1172,42 +1207,82 @@ class JAXEpochStackedIterator(JAXEpochIterator):
         return self.data_adapter.get_jax_iterator()
 
     def __next__(self):
-        if not self._group_queue:
-            self._enqueue_groups(self._group_prefetch_n)
-        if not self._group_queue:
+        self._maybe_start_producer()
+        item = self._prefetch_queue.get()
+        if item is self._queue_end:
+            if self._producer_error is not None:
+                raise self._producer_error
             raise StopIteration
-
-        item = self._group_queue.popleft()
-        self._enqueue_groups(1)
         return item
 
-    def _enqueue_groups(self, n):
-        for _ in range(n):
+    def _maybe_start_producer(self):
+        if self._producer_thread is not None:
+            return
+
+        import queue
+        import threading
+
+        self._producer_stop_event = threading.Event()
+        self._prefetch_queue = queue.Queue(maxsize=self._group_prefetch_n)
+        self._producer_thread = threading.Thread(
+            target=self._producer_loop,
+            name="jax_epoch_stacked_prefetch",
+            daemon=True,
+        )
+        self._producer_thread.start()
+
+    def _put_with_backpressure(self, item):
+        import queue
+
+        while not self._producer_stop_event.is_set():
             try:
-                begin_step, end_step, iterator = next(self._epoch_iterator)
-            except StopIteration:
-                return
-
-            target_steps = end_step - begin_step + 1
-            stacked_host, remainder_host = self._collect_group(
-                iterator, target_steps
-            )
-
-            actual_steps = self._count_steps(stacked_host, remainder_host)
-            if actual_steps == 0:
+                self._prefetch_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
                 continue
+        return False
 
-            stacked_batch = self._distribute_tree(stacked_host)
-            remainder_batch = self._distribute_tree(remainder_host)
+    def _producer_loop(self):
+        try:
+            while not self._producer_stop_event.is_set():
+                try:
+                    begin_step, end_step, iterator = next(self._epoch_iterator)
+                except StopIteration:
+                    break
 
-            actual_end_step = begin_step + actual_steps - 1
-            self._group_queue.append(
-                (
+                target_steps = end_step - begin_step + 1
+                stacked_host, remainder_host = self._collect_group(
+                    iterator, target_steps
+                )
+
+                actual_steps = self._count_steps(stacked_host, remainder_host)
+                if actual_steps == 0:
+                    continue
+
+                stacked_batch = self._distribute_tree(stacked_host)
+                remainder_batch = self._distribute_tree(remainder_host)
+
+                actual_end_step = begin_step + actual_steps - 1
+                item = (
                     begin_step,
                     actual_end_step,
                     (stacked_batch, remainder_batch),
                 )
-            )
+                if not self._put_with_backpressure(item):
+                    return
+        except Exception as e:
+            self._producer_error = e
+        finally:
+            self._put_with_backpressure(self._queue_end)
+
+    def _stop_producer(self):
+        if self._producer_stop_event is not None:
+            self._producer_stop_event.set()
+        if self._producer_thread is not None:
+            self._producer_thread.join(timeout=1.0)
+
+    def __del__(self):
+        self._stop_producer()
 
     def _collect_group(self, iterator, target_steps):
         full_batches = []
