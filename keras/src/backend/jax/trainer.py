@@ -254,21 +254,28 @@ class JAXTrainer(base_trainer.Trainer):
                     )
                     return _flatten_scan_outputs(outputs), state
                 else:
-                    n = _leading_dim(stacked_data)
-                    if n == 1:
-                        last = jax.tree.map(lambda xi: xi[-1], stacked_data)
-                        state, outputs = scan_body_with_outputs(state, last)
-                        return outputs, state
-
-                    prefix = jax.tree.map(lambda xi: xi[:-1], stacked_data)
-                    last = jax.tree.map(lambda xi: xi[-1], stacked_data)
-
-                    state, _ = jax.lax.scan(
-                        lambda s, d: (scan_body_no_outputs(s, d)[0], None),
+                    # n = _leading_dim(stacked_data)
+                    # if n == 1:
+                    #     last = jax.tree.map(lambda xi: xi[-1], stacked_data)
+                    #     state, outputs = scan_body_with_outputs(state, last)
+                    #     return outputs, state
+                    #
+                    # prefix = jax.tree.map(lambda xi: xi[:-1], stacked_data)
+                    # last = jax.tree.map(lambda xi: xi[-1], stacked_data)
+                    #
+                    # state, _ = jax.lax.scan(
+                    #     lambda s, d: (scan_body_no_outputs(s, d)[0], None),
+                    #     init=state,
+                    #     xs=prefix,
+                    # )
+                    # state, outputs = scan_body_with_outputs(state, last)
+                    state, outputs = jax.lax.scan(
+                        scan_body_with_outputs,
                         init=state,
-                        xs=prefix,
+                        xs=stacked_data,
+                        unroll=2
                     )
-                    state, outputs = scan_body_with_outputs(state, last)
+                    outputs = jax.tree.map(lambda xi: xi[-1], outputs)
                     return outputs, state
 
             if not self.run_eagerly and self.jit_compile:
@@ -1123,32 +1130,46 @@ class JAXEpochIterator(EpochIterator):
 
 
 class JAXEpochStackedIterator(JAXEpochIterator):
-    """JAX epoch iterator that groups and stacks batches for steps_per_execution.
+    """JAX epoch iterator that groups batches on the host before device transfer.
 
     Each iteration returns:
         (begin_step, end_step, (stacked_batch, remainder_batch))
 
     where:
       - stacked_batch is a pytree stacked on axis 0 with shape [k, batch, ...]
-        for 1 <= k <= steps_per_execution, or None if no full batch was collected.
+        for 1 <= k <= steps_per_execution, or None.
       - remainder_batch is the final partial batch if encountered, else None.
+
+    Unlike the previous version, this iterator:
+      1. reads raw batches from the data adapter,
+      2. groups and stacks them on the host,
+      3. transfers the grouped object to device once,
+      4. prefetches grouped items.
     """
 
     def __init__(self, *args, **kwargs):
         self._configured_batch_size = kwargs.get("batch_size", None)
         self.batch_size = self._configured_batch_size
         super().__init__(*args, **kwargs)
-        self.n = self.steps_per_execution + 1
         self._group_prefetch_n = 2
         self._group_queue = collections.deque()
+        self._layout_cache = {}
 
     def reset(self):
         self.batch_size = self._configured_batch_size
         self._group_queue = collections.deque()
+        self._layout_cache = {}
         super().reset()
 
     def get_batch(self):
-        return next(iter(self._get_iterator()))
+        # Keep symbolic build behavior simple: return one regular batch.
+        batch = next(iter(self.data_adapter.get_jax_iterator()))
+        return self._distribute_tree(batch)
+
+    def _get_iterator(self):
+        # Important: bypass parent per-batch device prefetch.
+        # We want raw batches here so we can stack first, then device_put once.
+        return self.data_adapter.get_jax_iterator()
 
     def __next__(self):
         if not self._group_queue:
@@ -1168,23 +1189,54 @@ class JAXEpochStackedIterator(JAXEpochIterator):
                 return
 
             target_steps = end_step - begin_step + 1
-            iterator = itertools.islice(iterator, target_steps)
-            grouped_iterator = self._group_batches(
-                iterator, stack_fn=jax.numpy.stack
+            stacked_host, remainder_host = self._collect_group(
+                iterator, target_steps
             )
-            try:
-                stacked_batch, remainder_batch = next(grouped_iterator)
-            except StopIteration:
-                continue
 
-            actual_steps = self._count_steps(stacked_batch, remainder_batch)
+            actual_steps = self._count_steps(stacked_host, remainder_host)
             if actual_steps == 0:
                 continue
 
-            end_step = begin_step + actual_steps - 1
+            stacked_batch = self._distribute_tree(stacked_host)
+            remainder_batch = self._distribute_tree(remainder_host)
+
+            actual_end_step = begin_step + actual_steps - 1
             self._group_queue.append(
-                (begin_step, end_step, (stacked_batch, remainder_batch))
+                (
+                    begin_step,
+                    actual_end_step,
+                    (stacked_batch, remainder_batch),
+                )
             )
+
+    def _collect_group(self, iterator, target_steps):
+        full_batches = []
+        remainder_batch = None
+
+        for _ in range(target_steps):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+
+            batch_dim = self._leading_dim(batch)
+
+            # Infer full batch size from the first observed batch if needed.
+            if self.batch_size is None:
+                self.batch_size = batch_dim
+
+            # Partial batch -> keep separate and stop grouping.
+            if batch_dim < self.batch_size:
+                remainder_batch = batch
+                break
+
+            full_batches.append(batch)
+
+        stacked_batch = None
+        if full_batches:
+            stacked_batch = self._stack_batches(full_batches)
+
+        return stacked_batch, remainder_batch
 
     def _count_steps(self, stacked_batch, remainder_batch):
         n = 0
@@ -1195,53 +1247,57 @@ class JAXEpochStackedIterator(JAXEpochIterator):
         return n
 
     def _leading_dim(self, batch):
-        leaves = tree.flatten(batch)
-        if not leaves:
-            raise ValueError("Batch pytree has no leaves.")
-        return leaves[0].shape[0]
+        for leaf in tree.flatten(batch):
+            if leaf is not None:
+                return leaf.shape[0]
+        raise ValueError("Batch pytree has no non-None leaves.")
 
-    def _stack_batches(self, batches, stack_fn):
-        return tree.map_structure(lambda *xs: stack_fn(xs, axis=0), *batches)
+    def _shape_signature(self, batch):
+        if batch is None:
+            return None
+        return tuple(
+            None if leaf is None else tuple(leaf.shape)
+            for leaf in tree.flatten(batch)
+        )
 
-    def _group_batches(self, iterator, stack_fn):
-        """Turn an iterator of single batches into grouped stacked batches.
+    def _stack_batches(self, batches):
+        """Stack a list of single batches on axis 0.
 
-        Yields:
-            (stacked_batch, remainder_batch)
+        Prefer NumPy stacking for host arrays. If the adapter already yields JAX
+        arrays, fall back to jax.numpy.stack to avoid host round-trips.
         """
-        iterator = iter(iterator)
+        leaves = [leaf for leaf in tree.flatten(batches[0]) if leaf is not None]
+        use_jax_stack = any(isinstance(leaf, jax.Array) for leaf in leaves)
+        stack_fn = jax.numpy.stack if use_jax_stack else np.stack
 
-        while True:
-            full_batches = []
-            remainder_batch = None
+        def _stack_or_none(*xs):
+            if xs[0] is None:
+                return None
+            return stack_fn(xs, axis=0)
 
-            for _ in range(self.steps_per_execution):
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    break
+        return tree.map_structure(_stack_or_none, *batches)
 
-                batch_dim = self._leading_dim(batch)
+    def _distribute_tree(self, batch):
+        if batch is None:
+            return None
 
-                # Infer full batch size from first observed batch if needed.
-                if self.batch_size is None:
-                    self.batch_size = batch_dim
+        distribution = distribution_lib.distribution()
+        if distribution is None:
+            return tree.map_structure(
+                lambda x: None if x is None else jax.device_put(x),
+                batch,
+            )
 
-                # If this is a partial batch, keep it separate and stop grouping.
-                if batch_dim < self.batch_size:
-                    remainder_batch = batch
-                    break
+        # Cache layouts by shape signature to avoid recomputing them.
+        signature = self._shape_signature(batch)
+        layouts = self._layout_cache.get(signature, None)
+        if layouts is None:
+            layouts = tree.map_structure(
+                lambda d: None
+                if d is None
+                else distribution.get_data_layout(d.shape).backend_layout,
+                batch,
+            )
+            self._layout_cache[signature] = layouts
 
-                full_batches.append(batch)
-
-            if not full_batches and remainder_batch is None:
-                return
-
-            stacked_batch = None
-            if full_batches:
-                stacked_batch = self._stack_batches(full_batches, stack_fn)
-
-            yield stacked_batch, remainder_batch
-
-    def _get_iterator(self):
-        return super()._get_iterator()
+        return _distribute_data(batch, layouts)
